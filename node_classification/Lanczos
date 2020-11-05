@@ -1,0 +1,259 @@
+!sudo apt-get install libmetis-dev
+!pip install metis
+import metis
+import random
+import tensorflow as tf
+from scipy import sparse
+import scipy.io as sio
+
+# hyperparameters
+hidden = 512
+latent = 256
+learning_rate = 0.01
+epochs = 1000
+nparts = 50
+batch_size = 1
+K = 1
+
+filename = '/content/drive/My Drive/TDK/ppi.mat'
+
+mat_dict = sio.loadmat(filename)
+A = mat_dict['A']
+X = mat_dict['X']
+Y = mat_dict['Y']
+train_mask = mat_dict['train_mask'][0].astype(bool)
+val_mask = mat_dict['val_mask'][0].astype(bool)
+test_mask = mat_dict['test_mask'][0].astype(bool)
+
+A_train = A
+X_train = X
+
+def cluster_graph(A, nparts):
+  edge_cuts, parts = metis.part_graph([neighbors for neighbors in A.tolil().rows], nparts=nparts)
+  print('Number of edge cuts: %d.' % edge_cuts)
+  slices = {}
+  for index, part in enumerate(parts):
+    if part not in slices:
+      slices[part] = []
+    slices[part].append(index)
+  return slices
+
+slices = cluster_graph(A_train, nparts)
+
+def preprocess_support(A):
+  N = A.shape[1]
+  D = sparse.csr_matrix(A.sum(axis=1))
+  norm = D.power(-0.5)
+  L = sparse.eye(N, dtype='float32') - A.multiply(norm).T.multiply(norm)
+  max_eigval = sparse.linalg.eigsh(L, k=1, return_eigenvectors=False)[0]
+  L_ = 2.0 / max_eigval * sparse.eye(N, dtype='float32') - L
+  return L_
+
+def toTensorSparse(support):
+  return tf.constant(support.todense())
+
+def toTensor(T):
+  return tf.constant(T)
+
+class bilinear_layer:
+
+  def __init__(self, indim, outdim):
+    initial_value = tf.initializers.he_normal()((indim, outdim,))
+    #self.weight = tf.Variable(initial_value=initial_value, trainable=True)
+
+  def __call__(self, tensor):
+    return tf.linalg.matmul(tensor, tf.transpose(tensor))
+
+class FC_layer:
+
+  def __init__(self, indim, outdim):
+    initial_value = tf.initializers.he_normal()((indim, outdim,))
+    self.weight = tf.Variable(initial_value=initial_value, trainable=True)
+
+  def __call__(self, tensor):
+    return tf.linalg.matmul(tensor, self.weight)
+
+class GC_layer:
+
+  def __init__(self, indim, outdim):
+    global K
+    self.K = K + 1
+    delta = tf.eye(K + 1, num_columns=1)
+    delta = tf.squeeze(delta)
+    self.filter = tf.Variable(initial_value=delta, trainable=True)
+    initial_value = tf.initializers.he_normal()((indim, outdim,))
+    self.weight = tf.Variable(initial_value=initial_value, trainable=True)
+
+  def Lanczos_algorithm(self, tensor, support, K):
+    Q = [tf.zeros(tensor.shape), tensor / tf.linalg.norm(tensor, axis=0)]
+    C = [tf.zeros(tensor.shape[1])]
+    B = [tf.zeros(tensor.shape[1])]
+    for k in range(1, K + 1):
+      z = tf.linalg.matmul(support, Q[k])
+      C.append(tf.einsum('ab, ab -> b', Q[k], z))
+      z = z - Q[k] * C[k] - Q[k-1] * B[k-1]
+      B.append(tf.linalg.norm(z, axis=0))
+      Q.append(z / B[k])
+    Vs = tf.transpose(tf.stack(Q[1:-1]))
+    Cs = tf.transpose(tf.stack(C[1:]))
+    Bs = tf.transpose(tf.stack(B[1:-1]))
+    Hs = tf.linalg.diag(Bs, k=-1) + tf.linalg.diag(Cs) + tf.linalg.diag(Bs, k=1)
+    return Vs, Hs
+
+  def __call__(self, tensor, support):
+    tensor = tf.linalg.matmul(tensor, self.weight)
+    V, H = self.Lanczos_algorithm(tensor, support, self.K)
+    delta = tf.one_hot(tf.zeros(tensor.shape[1], dtype=tf.uint8), self.K)
+    norm = tf.linalg.norm(tensor, axis=0)
+    eigvals, eigvecs = tf.linalg.eigh(H)
+    T = tf.einsum('abc, c, adc -> abd', eigvecs, self.filter, eigvecs)
+    result = tf.einsum('abc, acd, ad, a -> ba', V, T, delta, norm)
+    return result
+
+class Model:
+
+  def __init__(self, size_tuple, optimizer):
+    self.sources = []
+    self.build(size_tuple)
+    self.optimizer = optimizer
+    self.μ = None
+    self.logσ = None
+
+  def build(self, size_tuple):
+    X_dim, hidden, latent = size_tuple
+    self.A_enc_layer = GC_layer(X_dim, hidden)
+    self.A_μ_layer = GC_layer(hidden, latent)
+    self.A_logσ_layer = GC_layer(hidden, latent)
+    self.A_result_layer = bilinear_layer(latent, latent)
+    self.X_enc_layer = GC_layer(X_dim, hidden)
+    self.X_μ_layer = GC_layer(hidden, latent)
+    self.X_logσ_layer = GC_layer(hidden, latent)
+    self.X_result_layer = FC_layer(latent, X_dim)
+    layers = [self.A_enc_layer, self.X_enc_layer, self.A_μ_layer, self.X_μ_layer, self.A_logσ_layer, self.X_logσ_layer]
+    for layer in layers:
+      self.sources += [layer.weight, layer.filter]
+    self.sources += [self.X_result_layer.weight]
+  
+  def encode(self, X, S):
+    A_enc = tf.nn.relu(self.A_enc_layer(X, S))
+    A_μ = self.A_μ_layer(A_enc, S)
+    A_logσ = self.A_logσ_layer(A_enc, S)
+    X_enc = tf.nn.relu(self.X_enc_layer(X, S))
+    X_μ = self.X_μ_layer(X_enc, S)
+    X_logσ = self.X_logσ_layer(X_enc, S)
+    return (A_μ + X_μ) / 2.0, (A_logσ + X_logσ) / 2.0
+
+  def decode(self, sample):
+    A_result = self.A_result_layer(sample)
+    X_result = self.X_result_layer(sample)
+    return A_result, X_result
+
+  def predict(self, X, S):
+    self.μ, self.logσ = self.encode(X, S)
+    sample = self.μ + tf.math.exp(self.logσ) * tf.random.normal(self.logσ.shape)
+    re_A, re_X = self.decode(sample)
+    return re_A, re_X
+
+  def train(self, X, A, slices, batch_size, epochs):
+    for epoch in range(epochs):
+      samples = random.sample(slices.keys(), batch_size)
+      nodes = sum([slices[sample] for sample in samples], [])
+      # import numpy as np
+      # a = np.arange(A.shape[1])
+      # p = np.squeeze(np.asarray(A.sum(axis=1))) / np.sum(np.squeeze(np.asarray(A.sum(axis=1))))
+      # nodes = np.random.choice(a, size=2500, replace=False, p=p).tolist()
+      S_batch = toTensorSparse(preprocess_support(A[nodes].T[nodes]))
+      A_batch = toTensor(A.T[nodes].T[nodes].todense())
+      X_batch = tf.math.l2_normalize(toTensor(X[nodes]), axis=1)
+      with tf.GradientTape() as tape:
+        re_A, re_X = self.predict(X_batch, S_batch)
+        losses = self.loss(A_batch, re_A, X_batch, re_X)
+        loss_ = tf.reduce_sum(losses)
+        print(epoch, [loss.numpy() for loss in losses], loss_.numpy())
+      if loss_.numpy() != float('nan'):
+        grads = tape.gradient(loss_, self.sources)
+        self.optimizer.apply_gradients(zip(grads, self.sources))
+
+  def re_A_loss(self, A, re_A):
+    density = tf.reduce_sum(A) / tf.size(A, out_type=tf.float32)
+    pos_weight = (1.0 - density) / density
+    H_A = tf.nn.weighted_cross_entropy_with_logits(labels=A, logits=re_A, pos_weight=pos_weight) / (1.0 - density) / 2.0
+    loss = tf.reduce_mean(H_A)
+    return loss
+  
+  def re_X_loss(self, X, re_X):
+    H_X = tf.losses.mse(X, re_X)
+    loss = tf.reduce_mean(H_X)
+    return loss
+
+  def relative_entropy(self):
+    H_S = (self.μ**2.0 + tf.math.exp(self.logσ)**2.0 - 2.0 * self.logσ - 1.0) / 2.0
+    loss = tf.reduce_mean(H_S)
+    return loss / 1000.0
+
+  def weight_regularizer(self):
+    decoder_weights = tf.concat([tf.reshape(source, -1) for source in self.sources[-2:]], axis=0)
+    loss = tf.reduce_sum(decoder_weights**2.0)
+    return loss / 1000.0
+
+  def loss(self, A, re_A, X, re_X):
+    return self.re_A_loss(A, re_A), self.re_X_loss(X, re_X), self.relative_entropy()#, self.weight_regularizer()
+
+size_tuple = (X.shape[1], hidden, latent)
+optimizer = tf.optimizers.Adam(learning_rate=learning_rate)
+
+model = Model(size_tuple, optimizer)
+
+model.train(X_train, A_train, slices, batch_size, epochs)
+
+import numpy as np
+
+def Lanczos_algorithm(tensor, support, K):
+  Q = [tf.zeros(tensor.shape), tensor / np.linalg.norm(tensor, axis=0)]
+  C = [tf.zeros(tensor.shape[1])]
+  B = [tf.zeros(tensor.shape[1])]
+  for k in range(1, K + 1):
+    z = tf.constant(support.dot(Q[k].numpy()))
+    C.append(tf.einsum('ab, ab -> b', Q[k], z))
+    z = z - Q[k] * C[k] - Q[k-1] * B[k-1]
+    B.append(tf.linalg.norm(z, axis=0))
+    Q.append(z / B[k])
+  Vs = tf.transpose(tf.stack(Q[1:-1]))
+  Cs = tf.transpose(tf.stack(C[1:]))
+  Bs = tf.transpose(tf.stack(B[1:-1]))
+  Hs = tf.linalg.diag(Bs, k=-1) + tf.linalg.diag(Cs) + tf.linalg.diag(Bs, k=1)
+  return Vs, Hs
+
+def GC_function(tensor, support, layer):
+  tensor = tf.linalg.matmul(tensor, layer.weight)
+  V, H = Lanczos_algorithm(tensor, support, layer.K)
+  delta = tf.one_hot(tf.zeros(tensor.shape[1], dtype=tf.uint8), layer.K)
+  norm = tf.linalg.norm(tensor, axis=0)
+  eigvals, eigvecs = tf.linalg.eigh(H)
+  T = tf.einsum('abc, c, adc -> abd', eigvecs, layer.filter, eigvecs)
+  result = tf.einsum('abc, acd, ad, a -> ba', V, T, delta, norm)
+  return result.numpy()
+
+S = preprocess_support(A)
+X = X / np.linalg.norm(X, axis=1)[:, None]
+
+A_enc = np.maximum(GC_function(X, S, model.A_enc_layer), 0.0)
+A_μ = GC_function(A_enc, S, model.A_μ_layer)
+
+X_enc = np.maximum(GC_function(X, S, model.X_enc_layer), 0.0)
+X_μ = GC_function(X_enc, S, model.X_μ_layer)
+
+X = (A_μ + X_μ) / 2.0
+
+from sklearn.ensemble import RandomForestClassifier
+model = RandomForestClassifier(verbose=2, n_jobs=-1, n_estimators=20)
+model.fit(X[train_mask], Y[train_mask])
+from sklearn.metrics import accuracy_score, f1_score, average_precision_score
+accuracy = accuracy_score(Y[test_mask], model.predict(X[test_mask]))
+microf1 = f1_score(Y[test_mask], model.predict(X[test_mask]), average='micro')
+average_precision = average_precision_score(Y[test_mask], model.predict(X[test_mask]), average='micro')
+print(accuracy, microf1, average_precision)
+
+# cluster: 0.7849384503982622 0.9532297890108303 0.9322556651524945
+
+# fastgae:
